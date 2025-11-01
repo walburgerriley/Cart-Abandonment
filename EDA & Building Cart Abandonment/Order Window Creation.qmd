@@ -1,0 +1,290 @@
+---
+title: "EDA"
+format: html
+editor: visual
+---
+
+# Getting Data
+
+```{r data pulls}
+# Load required library
+library(readr)
+
+# Folder path
+folder_path <- "C:/Users/walbr/Desktop/U of U/4 - Fall Semester 2025/Senior Project - Cart Abandonment/Data/"
+
+# Get list of all CSV files
+files <- list.files(path = folder_path, pattern = "\\.csv$", full.names = TRUE)
+
+# Read all CSVs into a named list
+dfs <- lapply(files, read_csv)
+
+# Assign names like df_filename (without .csv)
+names(dfs) <- paste0("df_", tools::file_path_sans_ext(basename(files)))
+
+# Unpack into separate variables
+list2env(dfs, envir = .GlobalEnv)
+
+# Now you can use:
+# df_customer, df_cutoff_times, df_material, etc.
+
+```
+
+## Cleaning Visit Plan
+
+What section of Visit Plan is needed?
+
+Plan:
+
+-   Filter to Snapshot Dates to those after our first Google Analytics Time stamp.
+
+-   Filter out Future Plans as these will take place eventually but don't matter to us right now.
+
+-   Group by Customer ID and ELT_TS
+
+    -   In other words we are getting a table for every unique time the customer changed their plan.
+
+-   From here we will break out the customer unique plans into their order windows.
+
+```{r visit-plan-head}
+
+head(df_visit_plan)
+```
+
+```{r}
+First_GA_Date <- min(as.Date(df_google_analytics$EVENT_DATE), na.rm = TRUE)
+
+print(First_GA_Date)
+```
+
+We filter out all visit plans that were before this date.
+
+We will also filter out plans that are upcoming. We don't care about them until they actually take place in this record.
+
+```{r}
+library(dplyr)
+
+df_visit_plan_filtered <- df_visit_plan %>%
+  filter(
+    SNAPSHOT_DATE > First_GA_Date,           # Keep rows after first GA date
+    SNAPSHOT_DATE >= as.Date(ANCHOR_DATE)    # Remove rows before anchor_date (future plans)
+  )
+
+```
+
+```{r}
+# Row count of the original data
+nrow(df_visit_plan)
+
+# Row count of the filtered data
+nrow(df_visit_plan_filtered)
+
+round(nrow(df_visit_plan_filtered) / nrow(df_visit_plan), 2)
+```
+
+```{r}
+df_specific_customer <- df_visit_plan_filtered %>%
+  filter(CUSTOMER_ID == "0500245685")
+
+```
+
+We now to clean out some messy data in a few columns
+
+```{r}
+unique(df_visit_plan_filtered$FREQUENCY)
+```
+
+```{r}
+df_visit_plan_filtered <- df_visit_plan_filtered %>%
+  mutate(freq_days = case_when(
+    FREQUENCY %in% c("01", "1", "1.0", "Every Week On") ~ 7,
+    FREQUENCY %in% c("02", "2", "2.0", "Every Second Week On") ~ 14,
+    FREQUENCY %in% c("03", "3", "3.0", "Every Third Week On") ~ 21,
+    FREQUENCY %in% c("04", "4", "4.0", "Every Fourth Week On") ~ 28,
+    FREQUENCY == "Every Fifth Week On"  ~ 35,
+    FREQUENCY == "Every Sixth Week On"  ~ 42,
+    FREQUENCY == "Every Eighth Week On" ~ 56,
+    FREQUENCY == "Every Tenth Week On"  ~ 70,
+    TRUE ~ NA_real_   # default if not matched
+  ))
+```
+
+```{r}
+# Make sure ANCHOR_DATE is Date class
+df_visit_plan_filtered$ANCHOR_DATE <- as.Date(df_visit_plan_filtered$ANCHOR_DATE)
+
+# Get day of week as a string
+df_visit_plan_filtered$ANCHOR_DOW <- weekdays(df_visit_plan_filtered$ANCHOR_DATE)
+
+# Example output
+head(df_visit_plan_filtered$ANCHOR_DOW)
+```
+
+We will now take this filtered dataset and turn it into a summarized visit plan for each customer.
+
+```{r}
+df_visit_plan_summary <- df_visit_plan_filtered %>%
+  group_by(CUSTOMER_ID, ANCHOR_DATE) %>%
+  summarise(
+    across(
+      .cols = c(freq_days, SNAPSHOT_DATE,
+                SALES_OFFICE, SALES_OFFICE_DESC,
+                DISTRIBUTION_MODE, SHIPPING_CONDITIONS_DESC, ELT_TS),
+      .fns = list(min = ~min(.x, na.rm = TRUE),
+                  max = ~max(.x, na.rm = TRUE)),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+```
+
+Lets do some double checks that we are having some clean data.
+
+```{r}
+
+library(dplyr)
+
+df_visit_plan_odd <- df_visit_plan_summary %>%
+  # keep only rows where at least one column's min != max, excluding SNAPSHOT_DATE
+  filter(
+    rowSums(
+      across(
+        ends_with("_min") & !matches("^SNAPSHOT_DATE_min$"),  # exclude SNAPSHOT_DATE_min
+        ~ .x != get(sub("_min$", "_max", cur_column()))
+      )
+    ) > 0
+  )
+
+
+```
+
+We have some cases when Shipping Conditions change and distribution mode changes however we are going to define an order window as staying the same for a customer until it they get a new one per the anchor_date.\
+
+```{r}
+head(df_visit_plan_summary %>%
+  count(CUSTOMER_ID, sort = TRUE))
+
+```
+
+From here on out as they are the mostly the same I will be using the min columns as y final definitions.
+
+```{r}
+df_visit_plan_summary_lead <- df_visit_plan_summary %>%
+  group_by(CUSTOMER_ID) %>%                 
+  arrange(ANCHOR_DATE, .by_group = TRUE) %>% 
+  mutate(
+    end_plan_date = lead(ANCHOR_DATE),
+    next_plan_freq_days = lead(freq_days_min),
+    next_plan_dist_mode = lead(DISTRIBUTION_MODE_min),
+    next_plan_ship_cond = lead(SHIPPING_CONDITIONS_DESC_min),
+    row_num_forward = row_number(),           # forward row count
+    row_num_reverse = n():1,      # reverse row count
+    # Update end_plan_date for the last row of each customer
+    end_plan_date = if_else(
+      row_num_reverse == 1,
+      coalesce(end_plan_date, today()),
+      end_plan_date
+    )
+  ) %>%
+  ungroup()
+  
+
+
+```
+
+## Creating Order Windows
+
+```{r}
+head(df_visit_plan_summary_lead)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(purrr)
+
+## create Visit plan_ID
+df_visit_plan_summary_lead_id <- df_visit_plan_summary_lead %>%
+  group_by(CUSTOMER_ID) %>%
+  arrange(ANCHOR_DATE, .by_group = TRUE) %>%  # optional: order within customer
+  mutate(visit_plan_id = row_number()) %>%
+  ungroup()
+
+# Create the expanded table of order windows
+df_order_windows_expanded <- df_visit_plan_summary_lead_id %>%
+  select(visit_plan_id, CUSTOMER_ID, ANCHOR_DATE, end_plan_date, freq_days_min) %>%
+  mutate(
+    begin_order_window = pmap(
+      list(ANCHOR_DATE, end_plan_date, freq_days_min),
+      ~ seq(from = ..1, to = ..2, by = paste(..3, "days"))
+    )
+  ) %>%
+  unnest(cols = c(begin_order_window)) %>%
+  mutate(
+    end_order_window = pmin(begin_order_window + days(freq_days_min), end_plan_date)
+  )
+
+```
+
+This give us every order window for every customer. Now going to join a lot of the original information back to it.\
+
+```{r}
+df_order_windows_expanded <- df_order_windows_expanded %>%
+  group_by(CUSTOMER_ID, ANCHOR_DATE) %>%   # group by customer and anchor date
+  arrange(ANCHOR_DATE, .by_group = TRUE) %>%  # optional: ensure order within group
+  mutate(order_window_id = row_number(),
+         row_number_reverse = n():1) %>%  # row count within each group
+  ungroup()
+```
+
+## Selecting Columns Wanted
+
+Left joining back to what is needed with defined order windows. Will be double checking that row counts don't increase.
+
+```{r}
+
+df_order_window_all <- df_order_windows_expanded %>%
+  left_join(df_visit_plan_summary_lead_id, 
+            by = c("CUSTOMER_ID", "visit_plan_id"))
+
+
+```
+
+```{r}
+
+df_order_window_final <- df_order_window_all %>%
+  mutate(
+    first_order_window_on_visit_plan_flag = if_else(order_window_id == 1, 1, 0),
+    last_order_window_on_visit_plan_flag = if_else(row_number_reverse == 1, 1, 0),
+    first_visit_plan_flag = if_else(visit_plan_id == 1, 1, 0),
+    last_visit_plan_flag = if_else(row_num_reverse == 1, 1, 0)
+  ) %>%
+  select(
+    CUSTOMER_ID,
+    visit_plan_id,
+    order_window_id,
+    anchor_date = ANCHOR_DATE.x,
+    ELT_TS = ELT_TS_min,
+    visit_plan_end_date = end_plan_date.x,
+    freq_days = freq_days_min.x,
+    sales_office = SALES_OFFICE_min,
+    sales_office_desc = SALES_OFFICE_DESC_min,
+    distribution_mode = DISTRIBUTION_MODE_min,
+    SHIPPING_CONDITIONS_DESC = SHIPPING_CONDITIONS_DESC_min,
+    next_plan_freq_days,
+    next_plan_dist_mode,
+    next_plan_ship_cond,
+    first_order_window_on_visit_plan_flag,
+    last_order_window_on_visit_plan_flag,
+    first_visit_plan_flag,
+    last_visit_plan_flag
+  )
+
+head(df_order_window_final,20)
+```
+
+```{r}
+write.csv(df_order_window_final, "Order_Windows.csv", row.names = FALSE)
+
+```
