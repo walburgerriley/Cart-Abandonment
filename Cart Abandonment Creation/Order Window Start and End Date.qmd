@@ -1,0 +1,158 @@
+---
+title: "Cart Abandonment Definition"
+author: "Riley Walburger"
+format: html
+editor: visual
+---
+
+## Data
+
+```{r}
+library(readr)
+library(dplyr)
+library(stringr)
+library(lubridate)
+```
+
+```{r}
+
+df_Order_Windows <- read_csv("Order_Windows.csv")
+
+df_cutoff_times <- read_csv("Data/cutoff_times.csv")
+
+df_customer <- read_csv("Data/customer.csv")
+
+df_orders <- read_csv("Data/orders.csv")
+
+df_google_analytics <- read_csv("Data/google_analytics.csv", show_col_types = FALSE)
+```
+
+## Time Stamps (Put everything into EST)
+
+```{r}
+# Step 2: Define mapping only for those in data
+state_timezone_map <- list(
+  "AZ" = "America/Phoenix",
+  "CO" = "America/Denver",
+  "ID" = "America/Boise",
+  "NE" = "America/Chicago",   # Nebraska is mostly Central, but western NE is Mountain
+  "NM" = "America/Denver",
+  "NV" = "America/Los_Angeles",
+  "OR" = "America/Los_Angeles",
+  "UT" = "America/Denver",
+  "WA" = "America/Los_Angeles",
+  "WY" = "America/Denver"
+)
+
+# Mapping: hours difference relative to EST (EST = UTC-5)
+hours_from_est <- list(
+  "AZ" = -2,  # UTC-7 vs EST
+  "CO" = -2,
+  "ID" = -2,
+  "NE" = -1,
+  "NM" = -2,
+  "NV" = -3,
+  "OR" = -3,
+  "UT" = -2,
+  "WA" = -3,
+  "WY" = -2
+)
+
+# Mapping: hours difference relative to UTC
+hours_from_UTC <- list(
+  "AZ" = -7,
+  "CO" = -7,
+  "ID" = -7,
+  "NE" = -6,
+  "NM" = -7,
+  "NV" = -8,
+  "OR" = -8,
+  "UT" = -7,
+  "WA" = -8,
+  "WY" = -7
+)
+
+```
+
+### Customer Timezones
+
+```{r}
+# Step 1: Extract state (split by comma, strip spaces)
+df_customer <- df_customer %>%
+  mutate(STATE = str_split(SALES_OFFICE_DESCRIPTION, ",", simplify = TRUE)[, ncol(str_split(SALES_OFFICE_DESCRIPTION, ",", simplify = TRUE))],
+         STATE = str_trim(STATE))
+
+# Step 2: Get sorted unique states
+unique_states <- sort(unique(df_customer$STATE))
+print(unique_states)
+```
+
+```{r}
+# Step 3: Add timezone and offset columns
+df_customer <- df_customer %>%
+  mutate(
+    TIMEZONE = unlist(state_timezone_map[STATE]),
+    HOURS_FROM_EST = unlist(hours_from_est[STATE]),
+    HOURS_FROM_UTC = unlist(hours_from_UTC[STATE])
+  )
+
+# Show first few rows
+head(df_customer)
+```
+
+### Order Time Zones
+
+```{r}
+# Convert CREATED_DATE_UTC to datetime with UTC timezone
+df_orders <- df_orders %>%
+  mutate(
+    CREATED_DATE_UTC = ymd_hms(CREATED_DATE_UTC, tz = "UTC"),
+    
+    # Convert to Eastern Time
+    CREATED_DATE_TIME_EST = with_tz(CREATED_DATE_UTC, tzone = "US/Eastern")
+  )
+
+# Show first few rows
+head(df_orders)
+```
+
+## Cart Abandonment
+
+```{r}
+
+library(data.table)
+
+# Convert to data.table (in place)
+setDT(df_Order_Windows)
+
+# Convert anchor_date to IDate if it's a character
+if (is.character(df_Order_Windows$anchor_date)) {
+  df_Order_Windows[, anchor_date := as.IDate(anchor_date, format = "%m/%d/%Y")]
+}
+
+# Compute start and end timestamps
+df_Order_Windows[, order_window_start := anchor_date + (order_window_id - 1) * freq_days]
+
+# Compute end as the earlier of calculated end or visit_plan_end_date
+df_Order_Windows[, order_window_end := pmin(anchor_date + order_window_id * freq_days, visit_plan_end_date)]
+
+
+head(df_Order_Windows)
+```
+
+\
+
+```{r}
+# Convert created_date_est to date
+df_orders <- df_orders %>%
+  mutate(created_date = as_date(CREATED_DATE_EST))
+
+# Convert to data.table
+dt_orders <- as.data.table(df_orders)
+dt_windows <- as.data.table(df_Order_Windows)
+
+# Non-equi join
+dt_joined <- dt_windows[dt_orders, 
+                        on = .(CUSTOMER_ID, order_window_start <= created_date, order_window_end >= created_date),
+                        nomatch = 0L]
+```

@@ -1,0 +1,285 @@
+---
+title: "Feature Engineering"
+format: html
+editor: visual
+---
+
+## Libraries and Data
+
+```{r}
+library(readr)
+library(dplyr)
+library(data.table)
+library(janitor)
+library(lubridate)
+library(ggplot2)
+library(lattice)
+library(caret)
+library(pROC)
+library(smotefamily)   # for SMOTE
+
+```
+
+```{r}
+
+# data with abandonment 
+order_window_final <- fread("order_window_with_abandonment.csv") 
+
+material <- fread("data/material.csv") |> 
+  clean_names()
+
+
+orders <- fread("data/orders.csv") |> 
+  clean_names()
+
+sales <- fread("data/sales.csv") |> 
+  clean_names()
+
+customer <- fread("data/customer.csv") |> 
+  clean_names() |> 
+  rename(customer_id = customer_number, # match google analytics
+         plant_id = sales_office)
+```
+
+## Feature Engineering
+
+```{r}
+setDT(customer)
+setDT(order_window_final)
+setDT(orders)
+setDT(sales)
+
+
+
+order_window_final <- order_window_final |> 
+    select(-distribution_mode_description, -sales_office_desc, -sales_office, -distribution_mode)
+
+
+# --- CUSTOMER INFO MERGE ---
+features_v1 <- merge(
+  order_window_final,
+  customer[, .(customer_id,
+               sales_office_description,
+               distribution_mode_description,
+               shipping_conditions_description,
+               cold_drink_channel_description,
+               customer_sub_trade_channel_description)],
+  by = "customer_id",
+  all.x = TRUE
+)
+
+# --- RECENT ORDER ACTIVITY ---
+# Compute order frequency and recency at customer level
+orders_summary <- orders[, .(
+  total_orders = .N,
+  avg_order_qty = mean(order_quantity, na.rm = TRUE),
+  days_since_last_order = as.numeric(Sys.Date() - max(created_date_est, na.rm = TRUE))
+), by = customer_id]
+
+# --- RECENT SALES ACTIVITY ---
+sales_summary <- sales[, .(
+  total_sales_tx = .N,
+  total_volume = sum(physical_volume, na.rm = TRUE),
+  avg_profit = mean(gross_profit_dead_net, na.rm = TRUE)
+), by = customer_id]
+
+# --- MERGE EVERYTHING ---
+features_v1 <- merge(features_v1, orders_summary, by = "customer_id", all.x = TRUE)
+features_v1 <- merge(features_v1, sales_summary, by = "customer_id", all.x = TRUE)
+
+# --- HANDLE NAs ---
+features_v1[is.na(total_orders), total_orders := 0]
+features_v1[is.na(total_sales_tx), total_sales_tx := 0]
+
+# Report: head(features_v1), summary of numeric columns (e.g., summary(select_if(is.numeric)))
+head(features_v1)
+summary(features_v1[, .(total_orders, avg_order_qty, days_since_last_order, total_sales_tx, total_volume, avg_profit)])
+
+```
+
+This dataset has a very high target imbalance with a very small percentage of the data containing abandoned carts
+
+## Feature Engineering
+
+```{r}
+# Step 3 - Feature Engineering
+
+features_v2 <- copy(features_v1)
+
+# --- TIME FEATURES ---
+features_v2[, order_month := month(order_window_start)]
+features_v2[, order_weekday := weekdays(order_window_start)]
+features_v2[, order_year := year(order_window_start)]
+
+# --- RECENCY FLAG ---
+features_v2[, recent_order_flag := fifelse(days_since_last_order <= 30, 1, 0)]
+
+# --- BEHAVIORAL RATIOS ---
+features_v2[, avg_profit_per_tx := avg_profit / total_sales_tx]
+features_v2[, volume_per_order := total_volume / total_orders]
+features_v2[, order_freq_ratio := total_orders / total_sales_tx]
+
+# --- HANDLE INF / NA ---
+num_cols <- names(features_v2)[sapply(features_v2, is.numeric)]
+for (col in num_cols) {
+  features_v2[[col]][is.infinite(features_v2[[col]])] <- NA
+  features_v2[[col]][is.na(features_v2[[col]])] <- median(features_v2[[col]], na.rm = TRUE)
+}
+
+# --- ENCODE CATEGORICALS ---
+cat_cols <- c(
+  "sales_office_description",
+  "distribution_mode_description",
+  "shipping_conditions_description",
+  "cold_drink_channel_description",
+  "customer_sub_trade_channel_description"
+)
+
+# Convert to factor
+features_v2[, (cat_cols) := lapply(.SD, as.factor), .SDcols = cat_cols]
+
+# --- KEEP RELEVANT COLUMNS ---
+model_data <- features_v2[, .(
+  customer_id, order_window_id, cart_abandonment_flag,
+  total_orders, total_sales_tx, avg_profit, total_volume, avg_order_qty,
+  days_since_last_order, recent_order_flag,
+  avg_profit_per_tx, volume_per_order, order_freq_ratio,
+  order_month, order_weekday,
+  sales_office_description, distribution_mode_description,
+  shipping_conditions_description, cold_drink_channel_description,
+  customer_sub_trade_channel_description
+)]
+
+str(model_data)
+summary(model_data$cart_abandonment_flag)
+
+```
+
+This dataset has a very high target imbalance with a very small percentage of the data containing abandoned cart
+
+```{r}
+
+# Step 1: Keep only relevant columns before the join
+owa_subset <- order_window_final[, .(
+  customer_id,
+  visit_plan_id,
+  order_window_id,
+  order_window_start_full,
+  order_window_end_full
+)]
+
+setDT(orders)
+setDT(owa_subset)
+
+# Step 2: Perform the non-equi left join
+df_joined <- merge(
+  orders,
+  owa_subset,
+  by = "customer_id",
+  allow.cartesian = TRUE,  # needed for non-equi or multiple matches
+  all.x = TRUE
+)[
+  created_date_est >= order_window_start_full &
+  created_date_est <= order_window_end_full
+]
+
+# Step 3: Group by to count orders per window
+order_rollup <- df_joined[
+  ,
+  .(
+    order_count = .N,
+    total_order_qty = sum(order_quantity, na.rm = TRUE)
+  ),
+  by = .(customer_id, visit_plan_id, order_window_id)
+]
+
+summary(order_rollup)
+```
+
+## Logistic Regression
+
+### Train Test Split
+
+```{r}
+set.seed(123)
+
+train_index <- createDataPartition(model_data$cart_abandonment_flag, p = 0.8, list = FALSE)
+train_data <- model_data[train_index, ]
+test_data  <- model_data[-train_index, ]
+```
+
+```{r}
+train_data <- train_data %>%
+  select(where(~ length(unique(.)) > 1))
+```
+
+### Model Training
+
+```{r}
+train_data <- train_data %>%
+  select(where(~ length(unique(.)) > 1))
+
+model <- glm(cart_abandonment_flag ~ .,
+             data = train_data,
+             family = binomial)
+
+summary(model)
+```
+
+### Evaluate
+
+```{r}
+test_data$pred_prob <- predict(model, newdata = test_data, type = "response")
+
+roc_obj <- roc(test_data$cart_abandonment_flag, test_data$pred_prob)
+auc_value <- auc(roc_obj)
+
+print(auc_value)
+plot(roc_obj, col = "blue", lwd = 2, main = paste("ROC Curve (AUC =", round(auc_value, 3), ")"))
+```
+
+```{r}
+coords(roc_obj, "best", ret = c("threshold", "sensitivity", "specificity"))
+
+best_cutoff <- coords(roc_obj, "best", ret = "threshold")
+test_data$pred_class <- ifelse(test_data$pred_prob > best_cutoff, 1, 0)
+
+table(Predicted = test_data$pred_class, Actual = test_data$cart_abandonment_flag)
+```
+
+A basic Logistic Regression is a majority class classifier because of how one sided our data is. We will need to do some downsampling or another method in order to regonize the cart_abandonment a bit better.\
+\
+However this can be our estimate to beat. If we can beat a majority class we are doing much better!
+
+```{r}
+table(train_data$cart_abandonment_flag)
+prop.table(table(train_data$cart_abandonment_flag))
+```
+
+## Balancing Data
+
+```{r}
+set.seed(123)
+train_balanced <- downSample(
+  x = subset(train_data, select = -cart_abandonment_flag),
+  y = as.factor(train_data$cart_abandonment_flag),
+  yname = "cart_abandonment_flag"
+)
+
+table(train_balanced$cart_abandonment_flag)
+```
+
+### Down Sampling
+
+```{r}
+model_down <- glm(cart_abandonment_flag ~ .,
+                  data = train_balanced,
+                  family = binomial)
+
+```
+
+### 
+
+```{r}
+
+```
