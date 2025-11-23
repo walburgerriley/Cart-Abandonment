@@ -1,0 +1,498 @@
+---
+title: "Modeling Assignment: Swire Capstone"
+author: "Ethan Aslami, Riley Walburger, Tara Connin"
+date: 10/26/2025
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    number-depth: 2
+    toc-location: left
+    toc-title: "Contents"
+    code-fold: false
+    code-summary: "🖱️ Click to Show Code"
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false---
+---
+
+# Introduction 
+The goal of this modeling notebook is to develop a few predictive models that estimate the likelihood of cart abandonment within the MyCoke360 platform. The model will use features created from customer behavior, session activity, timing relative to cutoff windows, and operational scheduling to identify factors associated with incomplete purchases. By predicting the probability that a customer will abandon their cart, the analysis supports Swire Coca-Cola’s objective of improving online order completion and improving digital sales performance.
+
+This notebook focuses on implementing a regression-based modeling approach to establish a strong baseline for prediction and interpretability. The process includes conducting feature engineering, defining a baseline model, selecting appropriate models, and evaluating models using cross-validation. Model performance will be assessed using the area under the ROC curve. The best-performing model will be validated for reliability and used to identify key factors associated with cart abandonment.
+
+# Setup + Data Prep
+```{r}
+library(data.table)
+library(caret)
+library(tidyverse)
+library(janitor)
+library(pROC)
+library(randomForest)
+library(xgboost)
+library(ranger)
+library(smotefamily)
+
+
+# data with abandonment 
+order_window_final <- fread("order_window_with_abandonment.csv") 
+
+material <- fread("data/material.csv") |> 
+  clean_names()
+
+
+orders <- fread("data/orders.csv") |> 
+  clean_names()
+
+sales <- fread("data/sales.csv") |> 
+  clean_names()
+
+customer <- fread("data/customer.csv") |> 
+  clean_names() |> 
+  rename(customer_id = customer_number, # match google analytics
+         plant_id = sales_office)
+
+google_analytics <- fread("data/google_analytics.csv") |> clean_names()
+
+
+
+glimpse(order_window_final)
+glimpse(material)
+glimpse(orders)
+glimpse(sales)
+glimpse(customer)
+```
+
+
+### Basic data understanding and target inspection
+```{r}
+# Check target distribution
+target_summary <- order_window_final[, .(
+  total_obs = .N,
+  abandoned = sum(cart_abandonment_flag, na.rm = TRUE),
+  pct_abandoned = mean(cart_abandonment_flag, na.rm = TRUE) * 100
+)]
+
+# Check unique customers and order windows
+counts_summary <- order_window_final[, .(
+  unique_customers = uniqueN(customer_id),
+  unique_order_windows = uniqueN(order_window_id)
+)]
+
+# Report: target_summary, na_summary (top 10 rows), counts_summary
+target_summary
+counts_summary
+
+# Plot abandoned vs non-abandoned counts
+ggplot(order_window_final, aes(x = factor(cart_abandonment_flag))) +
+  geom_bar(fill = "darkgreen") +
+  scale_x_discrete(labels = c("Not Abandoned", "Abandoned")) +
+  labs(
+    title = "Cart Abandonment Distribution",
+    x = "Cart Abandonment",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+```
+
+- This dataset has a very high target imbalance with a very small percentage of the data containing abandoned carts 
+
+
+
+## Feature Engineering 
+- Here we add features from the customer data, sales data, orders data, and google analytics data aggregated at the customer level
+```{r, results='hide'}
+
+# --- CUSTOMER INFO MERGE ---
+features_v1 <- merge(
+  order_window_final,
+  customer[, .(customer_id,
+               sales_office_description,
+               distribution_mode_description,
+               shipping_conditions_description,
+               cold_drink_channel_description,
+               customer_sub_trade_channel_description)],
+  by = "customer_id",
+  all.x = TRUE
+)
+
+# --- RECENT ORDER ACTIVITY ---
+# Compute order frequency and recency at customer level
+orders_summary <- orders[, .(
+  total_orders = .N,
+  avg_order_qty = mean(order_quantity, na.rm = TRUE),
+  days_since_last_order = as.numeric(Sys.Date() - max(created_date_est, na.rm = TRUE))
+), by = customer_id]
+
+# --- RECENT SALES ACTIVITY ---
+sales_summary <- sales[, .(
+  total_sales_tx = .N,
+  total_volume = sum(physical_volume, na.rm = TRUE),
+  avg_profit = mean(gross_profit_dead_net, na.rm = TRUE)
+), by = customer_id]
+
+# --- MERGE EVERYTHING ---
+features_v1 <- merge(features_v1, orders_summary, by = "customer_id", all.x = TRUE)
+features_v1 <- merge(features_v1, sales_summary, by = "customer_id", all.x = TRUE)
+
+# --- HANDLE NAs ---
+features_v1[is.na(total_orders), total_orders := 0]
+features_v1[is.na(total_sales_tx), total_sales_tx := 0]
+
+# Report: head(features_v1), summary of numeric columns (e.g., summary(select_if(is.numeric)))
+head(features_v1)
+summary(features_v1[, .(total_orders, avg_order_qty, days_since_last_order, total_sales_tx, total_volume, avg_profit)])
+```
+
+
+```{r, results='hide'}
+# Step 3 - Feature Engineering
+
+features_v2 <- copy(features_v1)
+
+# --- TIME FEATURES ---
+features_v2[, order_month := month(order_window_start)]
+features_v2[, order_weekday := weekdays(order_window_start)]
+features_v2[, order_year := year(order_window_start)]
+
+# --- RECENCY FLAG ---
+features_v2[, recent_order_flag := fifelse(days_since_last_order <= 30, 1, 0)]
+
+# --- BEHAVIORAL RATIOS ---
+features_v2[, avg_profit_per_tx := avg_profit / total_sales_tx]
+features_v2[, volume_per_order := total_volume / total_orders]
+features_v2[, order_freq_ratio := total_orders / total_sales_tx]
+
+# --- HANDLE INF / NA ---
+num_cols <- names(features_v2)[sapply(features_v2, is.numeric)]
+for (col in num_cols) {
+  features_v2[[col]][is.infinite(features_v2[[col]])] <- NA
+  features_v2[[col]][is.na(features_v2[[col]])] <- median(features_v2[[col]], na.rm = TRUE)
+}
+
+# --- ENCODE CATEGORICALS ---
+cat_cols <- c(
+  "sales_office_description",
+  "distribution_mode_description",
+  "shipping_conditions_description",
+  "cold_drink_channel_description",
+  "customer_sub_trade_channel_description"
+)
+
+# Keep only columns that exist in features_v2
+cat_cols <- cat_cols[cat_cols %in% names(features_v2)]
+
+# Only convert if there are columns left
+if (length(cat_cols) > 0) {
+  features_v2[, (cat_cols) := lapply(.SD, as.factor), .SDcols = cat_cols]
+}
+
+
+# --- AGGREGATED CUSTOMER FEATURES FROM GOOGLE ANALYTICS ---
+customer_features <- google_analytics[, .(
+  total_events = .N,                                         # Total number of events for this customer
+  total_purchases = sum(event_name == "purchase", na.rm = TRUE),  # Count of purchase events
+  total_views = sum(grepl("view", event_name), na.rm = TRUE),     # Count of all view-type events (page views, item views)
+  active_days = uniqueN(event_date),                         # Number of unique days customer was active
+  mobile_events = sum(device_category == "mobile", na.rm = TRUE), # Number of events from mobile devices
+  desktop_events = sum(device_category == "desktop", na.rm = TRUE), # Number of events from desktop devices
+  top_os = names(sort(table(device_operating_system), decreasing = TRUE))[1], # Most frequently used OS
+  distinct_pages = uniqueN(event_page_name[event_page_name != "null"]), # Count of unique pages visited
+  distinct_items = uniqueN(unlist(str_split(items[items != "[]"], ","))) # Count of unique items interacted with
+), by = customer_id]
+
+# Merge GA features into features_v2
+features_v2 <- merge(features_v2, customer_features, by = "customer_id", all.x = TRUE)
+
+# Handle NAs from merge
+num_cols_ga <- setdiff(names(customer_features), "customer_id")
+for (col in num_cols_ga) {
+  if (is.numeric(features_v2[[col]])) {
+    features_v2[[col]][is.na(features_v2[[col]])] <- 0
+  } else {
+    features_v2[[col]][is.na(features_v2[[col]])] <- "Unknown"
+  }
+}
+
+# Convert top_os to factor
+features_v2[, top_os := as.factor(top_os)]
+
+# --- RATIOS FROM GA ---
+features_v2[, purchase_rate := fifelse(total_views > 0, total_purchases / total_views, 0)]
+features_v2[, mobile_ratio := fifelse(total_events > 0, mobile_events / total_events, 0)]
+
+# --- FINAL MODEL DATASET ---
+model_data <- features_v2[, .(
+  customer_id, order_window_id, cart_abandonment_flag,
+  
+  # Order / sales features
+  total_orders, total_sales_tx, avg_profit, total_volume, avg_order_qty,
+  days_since_last_order, recent_order_flag,
+  avg_profit_per_tx, volume_per_order, order_freq_ratio,
+  order_month, order_weekday,
+  sales_office_description,
+  shipping_conditions_description, cold_drink_channel_description,
+  customer_sub_trade_channel_description,
+  
+  # GA aggregated features
+  total_events, total_purchases, total_views, active_days,
+  mobile_events, desktop_events,
+  top_os, distinct_pages, distinct_items,
+  
+  # GA derived ratios
+  purchase_rate, mobile_ratio
+)]
+
+# --- CHECK RESULTS ---
+str(model_data)
+summary(model_data$cart_abandonment_flag)
+head(model_data)
+
+```
+
+# Modeling 
+- We will use 3 different models for this section 
+    - Logistic Regression 
+    - Random Forest Model 
+    - XGBoost Model
+- For each model we will go through the process of setting it up then we will show the model results
+
+
+## Set up data partition 
+- Here we create an 80/20 Train/Test split and we downsample the data so that we can run the models more efficiently for this assignment. 
+```{r}
+set.seed(123)
+# Setup a 80-20 split for train/test split 
+# Train/test split
+train_idx <- createDataPartition(model_data$cart_abandonment_flag, p = 0.8, list = FALSE)
+train_full <- model_data[train_idx]
+test_data  <- model_data[-train_idx]
+
+# Drop IDs / constants first (before SMOTE)
+cols_to_drop <- c("customer_id", "order_window_id")
+train_full <- train_full[, !cols_to_drop, with = FALSE]
+test_data  <- test_data[, !cols_to_drop, with = FALSE]
+
+# Ensure factor target
+train_full[, cart_abandonment_flag := factor(cart_abandonment_flag, levels = c(0, 1))]
+test_data[, cart_abandonment_flag  := factor(cart_abandonment_flag,  levels = c(0, 1))]
+
+# THis is for SMOTE but the models run too slowly with this so we couldn't run it 
+
+# # Separate predictors and target
+# x_train <- train_full[, !"cart_abandonment_flag", with = FALSE]
+# y_train <- as.numeric(as.character(train_full$cart_abandonment_flag))
+
+# # Identify categorical columns
+# cat_cols <- names(x_train)[sapply(x_train, is.factor) | sapply(x_train, is.character)]
+
+# # Convert to dummies using caret
+# if(length(cat_cols) > 0){
+#   dummies <- dummyVars(~ ., data = x_train, fullRank = TRUE)
+#   x_train <- as.data.table(predict(dummies, newdata = x_train))
+# }
+
+# # Now all columns are numeric, ready for SMOTE
+# set.seed(123)
+# smote_out <- SMOTE(X = x_train, target = y_train, K = 5, dup_size = 10)
+
+# # Combine back
+# train_data <- as.data.table(cbind(smote_out$data, cart_abandonment_flag = smote_out$data$class))
+# train_data[, class := NULL]  # remove duplicate
+# train_data[, cart_abandonment_flag := factor(cart_abandonment_flag, levels = c(0, 1))]
+
+
+# caret's downSample() expects predictors and a factor outcome
+# We use this downsample function and lose a lot of data because of the target imbalance but 
+# it is the only thing we can do right now to run the model efficiently 
+train_data <- downSample(
+  x = subset(train_full, select = -cart_abandonment_flag),
+  y = as.factor(train_full$cart_abandonment_flag),
+  yname = "cart_abandonment_flag"
+)
+
+train_data <- as.data.table(train_data)
+
+
+# Check new balance
+table(train_data$cart_abandonment_flag)
+prop.table(table(train_data$cart_abandonment_flag))
+```
+
+
+## Baseline Logistic Regression 
+- We will use a baseline model using only the numeric predictors for simplicity. 
+
+## Modeling Process
+
+```{r}
+# Keep only numeric predictors
+numeric_cols <- names(train_data)[sapply(train_data, is.numeric)]
+# Include the target column
+numeric_cols <- c("cart_abandonment_flag", numeric_cols[numeric_cols != "cart_abandonment_flag"])
+train_data <- train_data[, ..numeric_cols]
+
+# Ensure target is numeric 0/1
+train_data[, cart_abandonment_flag := as.numeric(as.character(cart_abandonment_flag))]
+
+# Fit baseline logistic regression
+logit_model <- glm(cart_abandonment_flag ~ ., 
+                   data = train_data, 
+                   family = binomial)
+
+# Summary for interpretability
+summary(logit_model)
+
+# Predicted probabilities
+preds_logit <- predict(logit_model, type = "response")
+
+```
+
+### Modeling Results 
+
+```{r}
+# See results 
+# coefficients
+coef_df <- data.frame(
+  Feature = names(coef(logit_model))[-1],
+  Coefficient = coef(logit_model)[-1]
+)
+coef_df[order(abs(coef_df$Coefficient), decreasing = TRUE), ]
+
+
+# Predict on test data
+preds_test <- predict(logit_model, newdata = test_data, type = "response")
+
+# Evaluate AUC on test data
+auc_test <- auc(test_data$cart_abandonment_flag, preds_test)
+cat("Baseline Logistic Regression Test AUC:", round(auc_test, 4), "\n")
+
+
+```
+
+## Random Forest 
+- These next 2 models will use all the variables categorical and numeric for prediction
+
+### Modeling Process
+```{r}
+
+# Run random forest
+rf_model <- ranger(
+  cart_abandonment_flag ~ .,
+  data = train_data,
+  num.trees = 200,
+  probability = TRUE,
+  importance = "impurity_corrected",
+  sample.fraction = 0.5
+)
+
+# Predict on test set
+rf_preds <- predict(rf_model, data = test_data)$predictions[,2]
+
+
+```
+
+### Modeling Performance 
+```{r}
+# See feature importance 
+imp <- sort(rf_model$variable.importance, decreasing = TRUE)
+
+# Horizontal barplot of feature importance
+par(mar = c(5, 12, 4, 2))  # increase left margin
+barplot(
+  rev(head(imp, 15)),
+  names.arg = rev(names(head(imp, 15))),
+  horiz = TRUE,
+  las = 1,             # horizontal text
+  col = "steelblue",
+  main = "Top 15 Feature Importances",
+  cex.names = 0.8      # shrink label size if needed
+)
+
+# See results
+auc(test_data$cart_abandonment_flag, rf_preds)
+
+```
+
+
+## XGBoost 
+
+### Modeling Process
+
+```{r, results='hide'}
+# Prepare matrix
+target_train <- as.numeric(as.character(train_data$cart_abandonment_flag))
+features_train <- model.matrix(cart_abandonment_flag ~ . - 1, data = train_data)
+dtrain <- xgb.DMatrix(data = features_train, label = target_train)
+
+target_test <- as.numeric(as.character(test_data$cart_abandonment_flag))
+features_test <- model.matrix(cart_abandonment_flag ~ . - 1, data = test_data)
+dtest <- xgb.DMatrix(data = features_test, label = target_test)
+
+# Cross-validation
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 6,
+  subsample = 0.7,
+  colsample_bytree = 0.7
+)
+
+set.seed(123)
+cv_results <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  nfold = 5,
+  early_stopping_rounds = 5,
+  maximize = TRUE,
+  verbose = 1
+)
+
+```
+
+```{r}
+# Define the Best iteration
+best_iter <- cv_results$best_iteration
+
+# Train final model using the best iteration
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = best_iter
+)
+
+```
+
+### Modeling Performance 
+
+```{r}
+# Feature importance
+importance <- xgb.importance(model = xgb_model)
+xgb.plot.importance(importance_matrix = importance, top_n = 15)
+
+
+# Columns used to train
+train_cols <- colnames(dtrain)
+
+# Reorder test columns to match training
+dtest <- xgb.DMatrix(data = as.matrix(test_data[, ..train_cols]), 
+                     label = test_data$cart_abandonment_flag)
+
+# Predict on test
+xgb_preds <- predict(xgb_model, dtest)
+auc(target_test, xgb_preds)
+
+```
+
+
+# Results 
+
+Using three different models, we’ve started to get a better sense of the factors that influence cart abandonment. While we’ll continue iterating and refining the models before the presentation, our initial results already show some interesting patterns. Total orders — the total number of orders a customer has made over their history — seems to affect abandonment. Total events also stands out, with customers who were very active on the platform. Days since last order is another important factor, as longer gaps between orders seem to contribute to abandonment. The number of distinct items a customer interacts with also looks relevant. We also think it would be interesting to dig further into mobile vs desktop events to see how device type impacts abandonment. Overall, this step gives us a solid starting point for modeling, and we’ll keep improving it as we prepare for the presentation. We still think that the main outcome of this part of the project shoule be to provide actionable insights for Swire and we will keep working on ways to define these reccomendations throughout the next couple weeks. 
+
