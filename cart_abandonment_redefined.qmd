@@ -1,0 +1,1517 @@
+---
+title: "Cart Abandonment Redefined"
+date: 10/26/2025
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    number-depth: 2
+    toc-location: left
+    toc-title: "Contents"
+    code-fold: false
+    code-summary: "Click to Show Code"
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false---
+---
+
+# New Abandonment Definition
+- We define cart abandonment at the session level rather than the individual event level to better capture actual customer shopping behavior. A shopping session is defined as a sequence of add_to_cart events for a given customer where consecutive events occur within 30 minutes of each other. If more than 30 minutes elapse between add_to_cart events, a new session begins. This approach groups related shopping activity together—for example, a customer who adds five items to their cart over a 10-minute period is treated as a single shopping session, not five separate abandonment opportunities.
+
+- To identify purchases, we combine data from two sources: the Google Analytics purchase events and the Orders table (using the created_date_utc timestamp converted to EST). Since GA tracking can occasionally miss purchase events, incorporating the Orders table ensures comprehensive purchase capture. We deduplicate by customer and timestamp to avoid double-counting when a purchase appears in both data sources.
+
+- A session is flagged as abandoned if no purchase occurs within 72 hours (3 days) after the session ends. This 72-hour window accommodates the B2B purchasing patterns observed in our data, where customers may add items to cart during business hours but complete the purchase later, potentially through a sales representative or call center. The time-to-purchase is calculated from the end of the cart session (the timestamp of the last add_to_cart event in that session) to the next chronological purchase event for that customer. Sessions without any subsequent purchase, or where the purchase occurs beyond the 72-hour window, are classified as abandoned.
+
+- This session-based approach provides several analytical advantages: it reduces noise from rapid clicking behavior, aligns better with real-world shopping patterns, enables more meaningful intervention timing (e.g., triggering an email after a session ends rather than after every individual click), and surfaces new behavioral signals such as session duration, number of items added per session, and multiple sessions within the same day—all of which prove to be significant predictors of abandonment in our modeling.
+
+# Setup
+```{r}
+
+library(tidyverse)
+library(data.table)
+library(janitor)
+library(caret)
+library(randomForest)
+library(xgboost)
+
+
+customer <- fread("data/customer.csv") |> clean_names() |> 
+  rename(customer_id = customer_number)
+
+google_analytics <- fread("data/google_analytics.csv") |> clean_names()
+
+orders <- fread("data/orders.csv") |> clean_names()
+
+```
+
+
+# New Session Based Version of Abandonment
+
+### Time Zones 
+```{r}
+
+setDT(google_analytics)
+setDT(orders)
+
+# Handle timezones
+
+# GA timestamps - change to the same datatype we are using for orders
+google_analytics[, event_timestamp_est := force_tz(event_timestamp, tzone = "America/New_York")]
+
+# Orders timestamps - convert from UTC to EST
+orders[, created_timestamp_est := with_tz(created_date_utc, tzone = "America/New_York")]
+
+# Verify timezone conversion
+cat("Timezone verification:\n")
+cat("GA timestamp example:\n")
+print(google_analytics[1, .(event_timestamp, event_timestamp_est)])
+
+cat("\nOrders timestamp example:\n")
+print(orders[1, .(created_date_utc, created_timestamp_est)])
+
+```
+
+## Combine all purchases from GA + Orders table
+
+```{r}
+
+# Extract GA purchase events
+ga_purchase <- google_analytics[event_name == "purchase", 
+                                .(customer_id, 
+                                  purchase_ts = event_timestamp_est,
+                                  source = "GA")]
+
+cat("GA purchases:", nrow(ga_purchase), "\n")
+
+# Create purchase events from orders table
+# IMPORTANT: Orders table has multiple rows per order (line items)
+# We need to get unique orders by customer_id + timestamp
+orders_purchase <- unique(orders[, .(customer_id, 
+                                     purchase_ts = created_timestamp_est)],
+                         by = c("customer_id", "purchase_ts"))
+
+# Add source column
+orders_purchase[, source := "Orders"]
+
+cat("Orders purchases (unique orders):", nrow(orders_purchase), "\n")
+
+# Combine both sources
+all_purchases <- rbindlist(list(ga_purchase, orders_purchase), 
+                          use.names = TRUE)
+
+cat("Combined purchases (before deduplication):", nrow(all_purchases), "\n")
+
+# Now deduplicate by customer_id + purchase_ts
+all_purchases <- unique(all_purchases, by = c("customer_id", "purchase_ts"))
+
+cat("Combined purchases (after deduplication):", nrow(all_purchases), "\n")
+
+# Check how many were duplicates (overlap between GA and Orders)
+n_duplicates <- nrow(ga_purchase) + nrow(orders_purchase) - nrow(all_purchases)
+cat("Duplicates removed (GA-Orders overlap):", n_duplicates, "\n")
+cat("Percentage overlap:", round(n_duplicates / nrow(ga_purchase) * 100, 2), "% of GA purchases\n")
+
+# Check coverage
+cat("\nPurchases only in GA:", sum(ga_purchase$customer_id %in% setdiff(ga_purchase$customer_id, orders_purchase$customer_id)), "\n")
+cat("Purchases only in Orders:", nrow(orders_purchase) - n_duplicates, "\n")
+
+# Preview the data
+cat("\nSample of combined purchases:\n")
+print(head(all_purchases, 10))
+
+cat("\n✓ Step 2 complete: All purchases combined and deduplicated correctly\n")
+
+```
+
+## Extract add_to_cart events
+```{r}
+
+
+# Extract all add_to_cart events from GA
+ga_add_to_cart <- google_analytics[event_name == "add_to_cart", 
+                                   .(customer_id, 
+                                     add_to_cart_ts = event_timestamp_est)]
+
+cat("Total add_to_cart events:", nrow(ga_add_to_cart), "\n")
+
+# Check distribution by customer
+customer_cart_counts <- ga_add_to_cart[, .N, by = customer_id]
+cat("\nAdd to cart distribution:\n")
+cat("Unique customers with add_to_cart:", nrow(customer_cart_counts), "\n")
+cat("Avg add_to_cart events per customer:", round(mean(customer_cart_counts$N), 2), "\n")
+cat("Median add_to_cart events per customer:", median(customer_cart_counts$N), "\n")
+cat("Max add_to_cart events by one customer:", max(customer_cart_counts$N), "\n")
+
+# Preview
+cat("\nSample add_to_cart events:\n")
+print(head(ga_add_to_cart, 10))
+
+cat("\n✓ Step 3 complete: Add to cart events extracted\n")
+
+```
+
+## Match add_to_cart with purchases
+
+```{r}
+
+# Cart Abandonment Analysis - Step 4: Match add_to_cart with NEXT purchase
+# Using timestamp offset approach
+
+# Create a version of purchases with a small offset for the join
+# This ensures we find purchases AFTER the add_to_cart, not at the exact same time
+all_purchases_offset <- copy(all_purchases)
+all_purchases_offset[, purchase_ts_for_join := purchase_ts + 1]  # Add 1 second
+
+# Sort and key
+setorder(all_purchases_offset, customer_id, purchase_ts_for_join)
+setorder(ga_add_to_cart, customer_id, add_to_cart_ts)
+
+setkey(all_purchases_offset, customer_id, purchase_ts_for_join)
+setkey(ga_add_to_cart, customer_id, add_to_cart_ts)
+
+cat("Tables prepared for rolling join\n\n")
+
+# Perform rolling join
+# Now we're joining on offset timestamps, so exact matches won't happen
+cart_with_purchase <- all_purchases_offset[ga_add_to_cart, 
+                                           on = .(customer_id, purchase_ts_for_join = add_to_cart_ts),
+                                           roll = -Inf]
+
+cat("Rolling join complete\n")
+cat("Result has", nrow(cart_with_purchase), "rows\n\n")
+
+# Rename columns
+setnames(cart_with_purchase, c("purchase_ts", "purchase_ts_for_join"), 
+         c("matched_purchase_ts", "add_to_cart_ts"))
+
+# Reorder columns
+setcolorder(cart_with_purchase, c("customer_id", "add_to_cart_ts", "matched_purchase_ts", "source"))
+
+# Quick diagnostic
+no_purchase <- sum(is.na(cart_with_purchase$matched_purchase_ts))
+has_purchase <- sum(!is.na(cart_with_purchase$matched_purchase_ts))
+
+cat("Quick check:\n")
+cat("- No purchase found:", no_purchase, "\n")
+cat("- Has purchase:", has_purchase, "\n\n")
+
+# Show sample with time differences
+cat("Sample of joined data:\n")
+sample_data <- head(cart_with_purchase, 20)
+sample_data[, time_diff_hours := as.numeric(difftime(matched_purchase_ts, add_to_cart_ts, units = "hours"))]
+print(sample_data)
+
+# Check distribution of time differences
+if(has_purchase > 0) {
+  cart_with_purchase[, time_diff_hours := as.numeric(difftime(matched_purchase_ts, add_to_cart_ts, units = "hours"))]
+  
+  cat("\nTime difference distribution:\n")
+  cat("Min:", min(cart_with_purchase$time_diff_hours, na.rm = TRUE), "hours\n")
+  cat("Median:", median(cart_with_purchase$time_diff_hours, na.rm = TRUE), "hours\n")
+  cat("Mean:", round(mean(cart_with_purchase$time_diff_hours, na.rm = TRUE), 2), "hours\n")
+  cat("Max:", max(cart_with_purchase$time_diff_hours, na.rm = TRUE), "hours\n")
+}
+
+cat("\n✓ Step 4 complete\n")
+```
+
+
+### Create Abandonment 
+Here we use 72 hours as the window that a user has to make a a purchase, if there are no purchase events in this timeframe it is flagged as abandoned. 
+```{r}
+# Configuration
+ABANDONMENT_WINDOW_HOURS <- 72
+SESSION_GAP_MINUTES <- 30
+
+cat("=== SESSION-BASED CART ABANDONMENT ===\n")
+cat("Session gap:", SESSION_GAP_MINUTES, "minutes\n")
+cat("Abandonment window:", ABANDONMENT_WINDOW_HOURS, "hours\n\n")
+
+# STEP 1: Create shopping sessions from add_to_cart events
+cat("Step 1: Creating shopping sessions...\n")
+
+ga_add_to_cart_sessions <- copy(ga_add_to_cart)
+ga_add_to_cart_sessions <- ga_add_to_cart_sessions[order(customer_id, add_to_cart_ts)]
+
+# Create session IDs based on 30-minute gaps
+ga_add_to_cart_sessions[, time_since_last := 
+  as.numeric(difftime(add_to_cart_ts, shift(add_to_cart_ts, 1), units = "mins")),
+  by = customer_id
+]
+
+ga_add_to_cart_sessions[, new_session := 
+  is.na(time_since_last) | time_since_last > SESSION_GAP_MINUTES
+]
+
+# FIX: Session ID unique per customer
+ga_add_to_cart_sessions[, session_num := cumsum(new_session), by = customer_id]
+ga_add_to_cart_sessions[, session_id := paste0(customer_id, "_S", session_num)]
+
+# Summarize sessions
+cart_sessions <- ga_add_to_cart_sessions[, .(
+  session_start = min(add_to_cart_ts),
+  session_end = max(add_to_cart_ts),
+  n_adds = .N,
+  session_duration_mins = as.numeric(difftime(max(add_to_cart_ts), min(add_to_cart_ts), units = "mins")),
+  is_single_add = (.N == 1)
+), by = .(customer_id, session_id)]
+
+cat("Created", nrow(cart_sessions), "shopping sessions from", 
+    nrow(ga_add_to_cart_sessions), "add_to_cart events\n")
+cat("Avg adds per session:", round(mean(cart_sessions$n_adds), 2), "\n\n")
+
+# STEP 2: Match sessions to purchases (ALTERNATIVE - MOST RELIABLE)
+cat("Step 2: Matching sessions to purchases...\n")
+
+# Create a copy to preserve all columns
+cart_sessions_matched <- copy(cart_sessions)
+
+# For each session, find the next purchase
+setorder(all_purchases, customer_id, purchase_ts)
+
+cart_sessions_matched[, matched_purchase_ts := {
+  # Get purchases for this customer after session_end
+  customer_purchases <- all_purchases[customer_id == .BY$customer_id & 
+                                      purchase_ts > session_end]
+  if(nrow(customer_purchases) > 0) {
+    min(customer_purchases$purchase_ts)
+  } else {
+    as.POSIXct(NA)
+  }
+}, by = .(customer_id, session_id)]
+
+cat("Sessions matched to purchases\n\n")
+cat("Columns:", paste(names(cart_sessions_matched), collapse = ", "), "\n\n")
+
+# STEP 3: Calculate time to purchase and flag abandonment
+cat("Step 3: Flagging session abandonment...\n")
+
+cart_sessions_matched[, time_to_purchase_hours := 
+  as.numeric(difftime(matched_purchase_ts, session_end, units = "hours"))
+]
+
+cart_sessions_matched[, session_abandoned := fifelse(
+  is.na(time_to_purchase_hours) | time_to_purchase_hours > ABANDONMENT_WINDOW_HOURS,
+  1,
+  0
+)]
+
+cat("Session-level abandonment:\n")
+cat("Total sessions:", nrow(cart_sessions_matched), "\n")
+cat("Abandoned sessions:", sum(cart_sessions_matched$session_abandoned), "\n")
+cat("Converted sessions:", sum(cart_sessions_matched$session_abandoned == 0), "\n")
+cat("Session abandonment rate:", round(mean(cart_sessions_matched$session_abandoned) * 100, 2), "%\n\n")
+
+# VALIDATION
+cat("=== VALIDATION CHECKS ===\n")
+
+# Check for negative time differences
+if(any(!is.na(cart_sessions_matched$time_to_purchase_hours))) {
+  negative_times <- cart_sessions_matched[!is.na(time_to_purchase_hours) & 
+                                          time_to_purchase_hours < 0]
+  if(nrow(negative_times) > 0) {
+    cat("❌ ERROR:", nrow(negative_times), "purchases occur BEFORE session end!\n")
+    print(head(negative_times[, .(customer_id, session_end, matched_purchase_ts, time_to_purchase_hours)]))
+  } else {
+    cat("✓ All purchases occur AFTER session end\n")
+  }
+  
+  cat("\nTime to purchase stats (converted sessions only):\n")
+  converted <- cart_sessions_matched[!is.na(time_to_purchase_hours) & time_to_purchase_hours >= 0]
+  cat("  Min:", round(min(converted$time_to_purchase_hours), 4), "hours\n")
+  cat("  Median:", round(median(converted$time_to_purchase_hours), 2), "hours\n")
+  cat("  Max:", round(max(converted$time_to_purchase_hours), 2), "hours\n")
+}
+
+cat("\n✓ Session creation complete and validated\n")
+```
+
+# Small check for 1 customer to make sure logic is sound 
+```{r}
+# Check a specific customer with multiple sessions
+sample_customer <- cart_sessions[customer_id == 500245738]
+print(sample_customer[order(session_start)])
+
+# Should show multiple rows (sessions) for this customer
+# Each with different session_start, session_end, and n_adds
+
+# Verify session IDs are unique per customer
+session_check <- cart_sessions[, .(
+  unique_sessions = uniqueN(session_id),
+  total_adds = sum(n_adds)
+), by = customer_id]
+
+# total_adds should match original add_to_cart count per customer
+
+# Check their abandonment rate
+customer_abandonment <- cart_sessions_matched[customer_id == 500245738]
+cat("Sessions:", nrow(customer_abandonment), "\n")
+cat("Abandoned:", sum(customer_abandonment$session_abandoned), "\n")
+cat("Converted:", sum(customer_abandonment$session_abandoned == 0), "\n")
+```
+
+### Create session-level features for modeling
+
+```{r}
+
+modeling_data_sessions <- copy(cart_sessions_matched)
+
+# Make sure both are data.tables
+setDT(google_analytics)
+setDT(modeling_data_sessions)
+setDT(orders)
+
+# Keys for efficient joins
+setkey(google_analytics, customer_id, event_timestamp_est)
+setkey(modeling_data_sessions, customer_id, session_start)
+setkey(orders, customer_id, created_date_est)
+```
+
+
+# Feature Engineering
+
+## Helper Functions
+
+```{r}
+# Return NA if input is empty or all NA, otherwise compute min/max
+safe_min <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) NA_real_ else min(x, na.rm = TRUE)
+}
+
+safe_max <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+}
+```
+
+## Session Stats
+```{r}
+cat("Step 1: Creating session-level features...\n")
+
+# Temporal features based on session_start
+modeling_data_sessions[, `:=`(
+  hour_of_day = hour(session_start),
+  day_of_week = wday(session_start),
+  day_of_month = mday(session_start),
+  month = month(session_start),
+  is_weekend = ifelse(wday(session_start) %in% c(1, 7), 1, 0),
+  is_business_hours = ifelse(hour(session_start) >= 9 & hour(session_start) <= 17, 1, 0),
+  is_evening = ifelse(hour(session_start) >= 18, 1, 0),
+  is_morning = ifelse(hour(session_start) >= 6 & hour(session_start) < 12, 1, 0),
+  session_date = as.Date(session_start)
+)]
+
+# Session-specific features
+modeling_data_sessions[, `:=`(
+  is_quick_session = ifelse(session_duration_mins < 5, 1, 0),
+  is_long_session = ifelse(session_duration_mins > 30, 1, 0),
+  many_adds = ifelse(n_adds >= 5, 1, 0)
+)]
+```
+
+## Customer Before Session
+
+```{r}
+########## Cheanges made here to stop data Leakage ##### 
+###### Only allowing Past Transactions, not future #####
+
+# Rolling temporal join — only events before each session_start
+customer_overall_stats <- google_analytics[
+  modeling_data_sessions,
+  on = .(customer_id, event_timestamp_est < session_start),
+  .(
+    total_purchases_before = sum(event_name == "purchase", na.rm = TRUE),
+    total_add_to_carts_before = sum(event_name == "add_to_cart", na.rm = TRUE),
+    total_page_views_before = sum(event_name == "page_view", na.rm = TRUE),
+    total_events_before = .N,
+    first_event_date = if (.N > 0) min(event_timestamp_est, na.rm = TRUE) else as.POSIXct(NA),
+    last_event_date = if (.N > 0) max(event_timestamp_est, na.rm = TRUE) else as.POSIXct(NA),
+    # tenure in days (session_start - first event)
+    customer_days_since_first_event = if (.N > 0)
+      as.numeric(difftime(session_start, min(event_timestamp_est, na.rm = TRUE), units = "days"))
+    else NA_real_
+  ),
+  by = .EACHI
+]
+
+modeling_data_sessions <- cbind(
+  modeling_data_sessions,
+  customer_overall_stats[, -c("customer_id", "session_start"), with = FALSE]
+)
+```
+
+## Customer Ordering Before Session
+
+```{r}
+# Rolling temporal join — only orders before each session_start
+customer_order_stats <- orders[
+  modeling_data_sessions,
+  on = .(customer_id, created_timestamp_est < session_start),
+  .(
+    session_start = session_start,
+    total_orders_before = as.integer(uniqueN(created_timestamp_est)),
+    total_order_items_before = as.integer(.N),
+    avg_order_quantity_before = if (.N > 0) as.numeric(mean(order_quantity, na.rm = TRUE)) else NA_real_,
+    pct_call_center_before = if (.N > 0) as.numeric(sum(order_type == "CALL CENTER", na.rm = TRUE) / .N) else NA_real_,
+    unique_materials_ordered_before = as.integer(if (.N > 0) uniqueN(material_id) else 0),
+    unique_plants_before = as.integer(if (.N > 0) uniqueN(plant_id) else 0),
+    days_since_first_order = as.numeric(difftime(session_start, safe_min(created_timestamp_est), units = "days"))
+  ),
+  by = .EACHI
+]
+
+# Merge safely into session-level table
+modeling_data_sessions <- merge(
+  modeling_data_sessions,
+  customer_order_stats,
+  by = c("customer_id", "session_start"),
+  all.x = TRUE
+)
+```
+
+## Daily Sessions
+
+```{r}
+# Session frequency features (how many sessions this customer had that day)
+daily_session_counts <- modeling_data_sessions[, .(
+  sessions_same_day = .N
+), by = .(customer_id, session_date)]
+
+modeling_data_sessions <- merge(modeling_data_sessions, daily_session_counts, 
+                               by = c("customer_id", "session_date"), all.x = TRUE)
+
+# Session sequence
+modeling_data_sessions[order(customer_id, session_start), 
+                      session_sequence_in_day := seq_len(.N), 
+                      by = .(customer_id, session_date)]
+
+# Clean up NAs
+numeric_cols <- names(modeling_data_sessions)[sapply(modeling_data_sessions, is.numeric)]
+for (col in numeric_cols) {
+  modeling_data_sessions[is.na(get(col)), (col) := 0]
+}
+
+# Create derived features
+modeling_data_sessions[, purchase_to_cart_ratio := ifelse(total_add_to_carts_before > 0, 
+                                                           total_purchases_before / total_add_to_carts_before, 
+                                                           0)]
+
+modeling_data_sessions[, avg_adds_per_session := total_add_to_carts_before / 
+                                                 (.N + 1)]  # +1 to avoid division by zero
+
+cat("✓ Session-level modeling dataset ready\n\n")
+
+# SUMMARY
+cat("=== SESSION-BASED MODELING DATASET ===\n")
+cat("Total sessions:", nrow(modeling_data_sessions), "\n")
+cat("Total features:", ncol(modeling_data_sessions), "\n")
+cat("Target: session_abandoned\n")
+cat("Abandonment rate:", round(mean(modeling_data_sessions$session_abandoned) * 100, 2), "%\n\n")
+
+cat("Key differences from event-level:\n")
+cat("- Unit of analysis: Session (not individual add_to_cart)\n")
+cat("- Features: session_duration_mins, n_adds, sessions_same_day\n")
+cat("- Better captures: Shopping behavior patterns\n\n")
+
+cat("✓ Ready for session-based modeling!\n")
+```
+
+## Google Analytics (More Features)
+
+### Important GA Events Defined
+
+```{r}
+
+cart_events <- c("add_to_cart", "update_cart", "remove_from_cart")
+checkout_events <- c("view_cart", "proceed_to_checkout", "begin_checkout", "checkout_page_displayed")
+error_events <- c("Error_Updating_Session_Delivery", "Update_Cart_Details_For_Payment_Failed", 
+                  "Payment_API_Failed", "Get_Active_Cart_Items_Failed")
+
+# Combine all events we care about
+predictive_events <- c(cart_events, checkout_events, error_events)
+```
+
+### Count of Predictive GA Events
+
+```{r}
+# Counts per session of Each Event Group
+session_event_counts <- google_analytics[modeling_data_sessions,
+  on = .(customer_id, event_timestamp_est >= session_start, event_timestamp_est <= session_end),
+  .(
+    cart_event_count = sum(event_name %in% cart_events, na.rm = TRUE),
+    checkout_event_count = sum(event_name %in% checkout_events, na.rm = TRUE),
+    error_event_count = sum(event_name %in% error_events, na.rm = TRUE)
+  ),
+  by = .EACHI
+]
+
+# Merge counts into modeling_data_sessions
+modeling_data_sessions <- cbind(modeling_data_sessions, 
+                                session_event_counts[, .(cart_event_count, checkout_event_count, error_event_count)])
+```
+
+
+```{r}
+session_event_counts_individual <- google_analytics[modeling_data_sessions,
+  on = .(customer_id, event_timestamp_est >= session_start, event_timestamp_est <= session_end),
+  .(
+    session_start = session_start,     # include session_start
+    session_end = session_end,         # include session_end
+    event_name = event_name,
+    event_name_count = .N
+  ),
+  .EACHI
+][event_name %in% predictive_events]
+
+# Aggregate counts first
+session_event_counts_agg <- session_event_counts_individual[
+  , .(event_name_count = sum(event_name_count)),
+  by = .(customer_id, session_start, session_end, event_name)
+]
+
+# Then pivot
+session_event_counts_wide <- dcast(
+  session_event_counts_agg,
+  customer_id + session_start + session_end ~ event_name,
+  value.var = "event_name_count",
+  fill = 0
+)
+
+# Merge into your sessions table
+modeling_data_sessions <- merge(
+  modeling_data_sessions,
+  session_event_counts_wide,
+  by = c("customer_id", "session_start", "session_end"),
+  all.x = TRUE
+)
+```
+
+
+```{r}
+
+# tenure has a huge part of how many orders you have already had so I want a measurement of this ratio divided by how long you have been ordering wtih them
+modeling_data_sessions <- modeling_data_sessions %>%
+  mutate(
+    purchase_cart_per_day = purchase_to_cart_ratio / (days_since_first_order + 1)  # +1 to avoid division by zero
+  )
+# People that are often ordering very often tend to be different than the others. 
+modeling_data_sessions <- modeling_data_sessions %>%
+  mutate(
+    orders_per_day = total_purchases_before / (days_since_first_order + 1)  # +1 to avoid division by zero
+  )
+```
+
+
+#### Exclude Columns
+
+```{r}
+
+exclude_cols <- c("customer_id", "session_id", "session_start", "session_end", 
+                  "matched_purchase_ts", "session_date", 
+                  "first_event_date", "last_event_date", "source", 
+                  "time_to_purchase_hours", "time_since_last", "customer_changed", "new_session")
+
+# Exclude specific columns
+cart_sessions_model_data <- modeling_data_sessions %>%
+  select(-any_of(exclude_cols))
+```
+
+## Latest Sessions
+
+```{r}
+# Filter to latest session per customer
+latest_sessions <- modeling_data_sessions[order(customer_id, -session_start), .SD[1], by = customer_id]
+```
+
+# Target EDA 
+
+```{r}
+library(scales)
+library(patchwork)
+# Set enhanced theme for presentation
+theme_set(theme_minimal(base_size = 14) +
+          theme(plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+                plot.subtitle = element_text(size = 14, color = "gray40", hjust = 0.5),
+                axis.title = element_text(size = 14, face = "bold"),
+                axis.text = element_text(size = 12),
+                legend.title = element_text(size = 14, face = "bold"),
+                legend.text = element_text(size = 12),
+                legend.position = "top"))
+
+# Create output directory if it doesn't exist
+if(!dir.exists("plots")) {
+  dir.create("plots")
+}
+
+# 1. Overall Abandonment Rate - Bar Chart
+abandonment_summary <- modeling_data_sessions %>%
+  summarise(
+    total_sessions = n(),
+    abandoned = sum(session_abandoned),
+    converted = sum(session_abandoned == 0),
+    abandonment_rate = mean(session_abandoned) * 100
+  )
+
+p1 <- ggplot(abandonment_summary %>% 
+         pivot_longer(cols = c(abandoned, converted), 
+                     names_to = "status", 
+                     values_to = "count"),
+       aes(x = status, y = count, fill = status)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = paste0(format(count, big.mark = ","), "\n(", 
+                               round(count/abandonment_summary$total_sessions * 100, 1), "%)")),
+            vjust = -0.5, size = 6, fontface = "bold") +
+  scale_fill_manual(values = c("abandoned" = "#e74c3c", "converted" = "#27ae60"),
+                    labels = c("Abandoned", "Converted")) +
+  scale_x_discrete(labels = c("Abandoned", "Converted")) +
+  scale_y_continuous(labels = comma, limits = c(0, max(abandonment_summary$converted) * 1.15)) +
+  labs(title = "Session Abandonment Overview",
+       subtitle = paste0("Overall abandonment rate: ", 
+                        round(abandonment_summary$abandonment_rate, 1), "%"),
+       x = NULL,
+       y = "Number of Sessions",
+       fill = NULL) +
+  theme(panel.grid.major.x = element_blank(),
+        legend.position = "none",
+        axis.text = element_text(size = 13))
+
+ggsave("plots/01_abandonment_overview.png", p1, width = 10, height = 7, dpi = 300, bg = "white")
+
+
+# 2. Abandonment by Hour of Day
+p2 <- modeling_data_sessions %>%
+  group_by(hour_of_day) %>%
+  summarise(
+    abandonment_rate = mean(session_abandoned) * 100,
+    n_sessions = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = hour_of_day, y = abandonment_rate)) +
+  geom_line(color = "#3498db", size = 1.5) +
+  geom_point(aes(size = n_sessions), color = "#3498db", alpha = 0.7) +
+  scale_x_continuous(breaks = seq(0, 23, 2)) +
+  scale_y_continuous(labels = label_percent(scale = 1)) +
+  scale_size_continuous(range = c(3, 10), labels = comma) +
+  labs(title = "Abandonment Rate by Hour of Day",
+       subtitle = "Point size represents number of sessions",
+       x = "Hour of Day (0-23)",
+       y = "Abandonment Rate",
+       size = "Sessions") +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "right")
+
+ggsave("plots/02_abandonment_by_hour.png", p2, width = 12, height = 7, dpi = 300, bg = "white")
+
+
+# 3. Abandonment by Number of Items Added
+p3 <- modeling_data_sessions %>%
+  filter(n_adds <= 10) %>%
+  group_by(n_adds) %>%
+  summarise(
+    abandonment_rate = mean(session_abandoned) * 100,
+    n_sessions = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = factor(n_adds), y = abandonment_rate)) +
+  geom_col(aes(fill = abandonment_rate), show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(abandonment_rate, 1), "%")), 
+            vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "#27ae60", high = "#e74c3c") +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 30)) +
+  labs(title = "Abandonment Rate by Number of Items in Session",
+       subtitle = "Single-item sessions vs multi-item sessions",
+       x = "Number of Items Added to Cart",
+       y = "Abandonment Rate") +
+  theme(panel.grid.major.x = element_blank())
+
+ggsave("plots/03_abandonment_by_items.png", p3, width = 10, height = 7, dpi = 300, bg = "white")
+
+# 4. Abandonment by Session Duration
+p4 <- modeling_data_sessions %>%
+  filter(session_duration_mins <= 30) %>%
+  mutate(duration_bucket = cut(session_duration_mins,
+                               breaks = c(-0.1, 0, 1, 5, 10, 30),
+                               labels = c("0 min\n(Single click)", 
+                                        "0-1 min", 
+                                        "1-5 min", 
+                                        "5-10 min", 
+                                        "10-30 min"))) %>%
+  filter(!is.na(duration_bucket)) %>%
+  group_by(duration_bucket) %>%
+  summarise(
+    abandonment_rate = mean(session_abandoned) * 100,
+    n_sessions = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = duration_bucket, y = abandonment_rate, fill = duration_bucket)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(abandonment_rate, 1), "%\n(n=", 
+                               format(n_sessions, big.mark = ","), ")")), 
+            vjust = -0.5, size = 4.5, fontface = "bold") +
+  scale_fill_brewer(palette = "Blues") +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 30)) +
+  labs(title = "Abandonment Rate by Session Duration",
+       subtitle = "Quick sessions vs longer browsing sessions",
+       x = "Session Duration",
+       y = "Abandonment Rate") +
+  theme(panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(size = 11))
+
+ggsave("plots/04_abandonment_by_duration.png", p4, width = 11, height = 7, dpi = 300, bg = "white")
+
+
+# 5. Abandonment by Customer Purchase History
+p5 <- modeling_data_sessions %>%
+  mutate(purchase_history = case_when(
+    total_purchases_before == 0 ~ "0 (New)",
+    total_purchases_before <= 5 ~ "1-5",
+    total_purchases_before <= 10 ~ "6-10",
+    total_purchases_before <= 20 ~ "11-20",
+    TRUE ~ "20+"
+  )) %>%
+  mutate(purchase_history = factor(purchase_history,
+                                   levels = c("0 (New)", "1-5", "6-10", "11-20", "20+"))) %>%
+  filter(!is.na(purchase_history)) %>%
+  group_by(purchase_history) %>%
+  summarise(
+    abandonment_rate = mean(session_abandoned) * 100,
+    n_sessions = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = purchase_history, y = abandonment_rate, fill = purchase_history)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(abandonment_rate, 1), "%")), 
+            vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_brewer(palette = "Spectral", direction = -1) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 40)) +
+  labs(title = "Abandonment Rate by Customer Purchase History",
+       subtitle = "New customers vs repeat customers",
+       x = "Previous Purchases",
+       y = "Abandonment Rate") +
+  theme(panel.grid.major.x = element_blank())
+
+ggsave("plots/05_abandonment_by_history.png", p5, width = 10, height = 7, dpi = 300, bg = "white")
+
+
+
+# 6. Abandonment by Purchase-to-Cart Ratio
+p6 <- modeling_data_sessions %>%
+  filter(total_add_to_carts_before > 0) %>%
+  mutate(ratio_bucket = cut(purchase_to_cart_ratio,
+                           breaks = c(-0.1, 0, 0.25, 0.5, 0.75, 1.0),
+                           labels = c("0%\n(Never converted)", 
+                                    "1-25%", 
+                                    "26-50%", 
+                                    "51-75%", 
+                                    "76-100%"))) %>%
+  filter(!is.na(ratio_bucket)) %>%
+  group_by(ratio_bucket) %>%
+  summarise(
+    abandonment_rate = mean(session_abandoned) * 100,
+    n_sessions = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = ratio_bucket, y = abandonment_rate, fill = ratio_bucket)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(abandonment_rate, 1), "%")), 
+            vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_brewer(palette = "RdYlGn", direction = 1) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 50)) +
+  labs(title = "Abandonment Rate by Historical Conversion Rate",
+       subtitle = "Customer's past purchase-to-cart ratio",
+       x = "Historical Purchase-to-Cart Ratio",
+       y = "Abandonment Rate") +
+  theme(panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(size = 12))
+
+ggsave("plots/06_abandonment_by_conversion_rate.png", p6, width = 11, height = 7, dpi = 300, bg = "white")
+
+
+# 7. Abandonment by Weekend vs Weekday
+p7 <- modeling_data_sessions %>%
+  mutate(day_type = ifelse(is_weekend == 1, "Weekend", "Weekday")) %>%
+  filter(!is.na(day_type)) %>%
+  group_by(day_type) %>%
+  summarise(
+    abandonment_rate = mean(session_abandoned) * 100,
+    n_sessions = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = day_type, y = abandonment_rate, fill = day_type)) +
+  geom_col(show.legend = FALSE, width = 0.6) +
+  geom_text(aes(label = paste0(round(abandonment_rate, 1), "%\n(n=", 
+                               format(n_sessions, big.mark = ","), ")")), 
+            vjust = -0.5, size = 5.5, fontface = "bold") +
+  scale_fill_manual(values = c("Weekday" = "#3498db", "Weekend" = "#e67e22")) +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 25)) +
+  labs(title = "Abandonment Rate: Weekday vs Weekend",
+       subtitle = "Business day patterns",
+       x = NULL,
+       y = "Abandonment Rate") +
+  theme(panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(size = 13))
+
+ggsave("plots/07_abandonment_weekday_weekend.png", p7, width = 10, height = 7, dpi = 300, bg = "white")
+
+
+# 8. Multi-panel: Key Behavioral Indicators
+p8a <- modeling_data_sessions %>%
+  mutate(single_add = ifelse(is_single_add, "Single Item", "Multiple Items")) %>%
+  filter(!is.na(single_add)) %>%
+  group_by(single_add) %>%
+  summarise(abandonment_rate = mean(session_abandoned) * 100, .groups = "drop") %>%
+  ggplot(aes(x = single_add, y = abandonment_rate, fill = single_add)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(abandonment_rate, 1), "%")), 
+            vjust = -0.5, fontface = "bold", size = 5) +
+  scale_fill_manual(values = c("#e74c3c", "#27ae60")) +
+  scale_y_continuous(limits = c(0, 25)) +
+  labs(title = "Single vs Multiple Items", x = NULL, y = "Abandonment %") +
+  theme(panel.grid.major.x = element_blank(),
+        plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+        axis.text = element_text(size = 11))
+
+p8b <- modeling_data_sessions %>%
+  mutate(quick = ifelse(is_quick_session == 1, "Quick (<5 min)", "Longer (5+ min)")) %>%
+  filter(!is.na(quick)) %>%
+  group_by(quick) %>%
+  summarise(abandonment_rate = mean(session_abandoned) * 100, .groups = "drop") %>%
+  ggplot(aes(x = quick, y = abandonment_rate, fill = quick)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(abandonment_rate, 1), "%")), 
+            vjust = -0.5, fontface = "bold", size = 5) +
+  scale_fill_manual(values = c("#3498db", "#9b59b6")) +
+  scale_y_continuous(limits = c(0, 25)) +
+  labs(title = "Quick vs Longer Sessions", x = NULL, y = "Abandonment %") +
+  theme(panel.grid.major.x = element_blank(),
+        plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+        axis.text = element_text(size = 11))
+
+p8c <- modeling_data_sessions %>%
+  mutate(has_history = ifelse(total_purchases_before > 0, "Has Purchase History", "No Purchase History")) %>%
+  filter(!is.na(has_history)) %>%
+  group_by(has_history) %>%
+  summarise(abandonment_rate = mean(session_abandoned) * 100, .groups = "drop") %>%
+  ggplot(aes(x = has_history, y = abandonment_rate, fill = has_history)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(abandonment_rate, 1), "%")), 
+            vjust = -0.5, fontface = "bold", size = 5) +
+  scale_fill_manual(values = c("#e67e22", "#1abc9c")) +
+  scale_y_continuous(limits = c(0, 40)) +
+  labs(title = "Customer History", x = NULL, y = "Abandonment %") +
+  theme(panel.grid.major.x = element_blank(),
+        plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+        axis.text = element_text(size = 11))
+
+p8 <- p8a + p8b + p8c +
+  plot_annotation(title = "Key Behavioral Indicators of Abandonment",
+                  theme = theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5)))
+
+ggsave("plots/08_key_behavioral_indicators.png", p8, width = 14, height = 6, dpi = 300, bg = "white")
+
+
+# 12. Summary Statistics Table
+summary_stats <- modeling_data_sessions %>%
+  group_by(session_abandoned) %>%
+  summarise(
+    n_sessions = n(),
+    avg_items = mean(n_adds, na.rm = TRUE),
+    avg_duration_mins = mean(session_duration_mins, na.rm = TRUE),
+    pct_single_item = mean(is_single_add, na.rm = TRUE) * 100,
+    avg_prior_purchases = mean(total_purchases_before, na.rm = TRUE),
+    avg_prior_carts = mean(total_add_to_carts_before, na.rm = TRUE),
+    avg_pageviews = mean(total_page_views_before, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(status = ifelse(session_abandoned == 1, "Abandoned", "Converted"))
+
+print(summary_stats)
+```
+
+# Modeling 
+
+## RPART plot 
+
+```{r}
+library(tidyverse)
+library(caret) 
+library(janitor)
+library(data.table)
+library(pROC)
+modeling_data_sessions <- read_csv("session_ model_data.csv")
+```
+
+## Top Predictive Features
+
+```{r}
+library(rpart)
+library(rpart.plot)
+
+# Fit the tree
+tree_model <- rpart(
+  session_abandoned ~ .,              # target vs all numeric predictors
+  data = modeling_data_sessions,
+  method = "class",                   # classification tree
+  control = rpart.control(
+    minsplit = 20,                    # minimum rows to attempt a split
+    cp = 0.01,                        # complexity parameter to prune tree
+    maxdepth = 4                      # keep tree shallow
+  )
+)
+
+rpart.plot(
+  tree_model,
+  type = 2,        # type 2 = labels inside nodes
+  extra = 104,     # show probability per class and % observations
+  fallen.leaves = TRUE,
+  cex = 0.8
+)
+```
+
+```{r}
+# Fit tree with very low cp
+tree_model <- rpart(
+  session_abandoned ~ .,
+  data = modeling_data_sessions,
+  method = "class",
+  control = rpart.control(minsplit = 10, cp = 0.002, maxdepth = 6)
+)
+
+# Plot the tree
+rpart.plot(tree_model, type = 2, extra = 104, fallen.leaves = TRUE, cex = 0.8, nn = TRUE)
+```
+
+## Setup train test split and cv function 
+
+```{r}
+# SETUP: PREPARE MODELING DATA WITH TRAIN/TEST SPLIT
+
+cat("=== PREPARING MODELING DATASET ===\n\n")
+
+# Select features for modeling (exclude identifiers and timestamps)
+exclude_cols <- c("customer_id", "session_id", "session_start", "session_end", 
+                  "matched_purchase_ts", "session_date", 
+                  "first_event_date", "last_event_date", "event_timestamp_est",
+                  "created_timestamp_est", "time_to_purchase_hours")
+
+# Get all numeric features
+numeric_features <- names(modeling_data_sessions)[sapply(modeling_data_sessions, is.numeric)]
+numeric_features <- setdiff(numeric_features, c("session_abandoned", exclude_cols))
+
+cat("Selected", length(numeric_features), "numeric features\n")
+cat("Target variable: session_abandoned\n\n")
+
+# Prepare modeling dataset - FIX: Use select instead of ..
+model_df <- modeling_data_sessions %>%
+  select(session_abandoned, all_of(numeric_features))
+
+# Convert back to data.table if needed
+setDT(model_df)
+
+# Remove any rows with NA
+model_df <- na.omit(model_df)
+
+cat("Clean modeling dataset:", nrow(model_df), "sessions\n")
+cat("Target distribution:\n")
+print(table(model_df$session_abandoned))
+cat("\nAbandonment rate:", round(mean(model_df$session_abandoned) * 100, 2), "%\n\n")
+
+# TRAIN/TEST SPLIT (80/20)
+
+set.seed(123)
+train_idx <- createDataPartition(model_df$session_abandoned, p = 0.8, list = FALSE)
+train_data <- model_df[train_idx, ]
+test_data <- model_df[-train_idx, ]
+
+cat("Training set:", nrow(train_data), "sessions\n")
+cat("Test set:", nrow(test_data), "sessions\n")
+cat("Train abandonment rate:", round(mean(train_data$session_abandoned) * 100, 2), "%\n")
+cat("Test abandonment rate:", round(mean(test_data$session_abandoned) * 100, 2), "%\n\n")
+
+# SETUP: 5-FOLD CROSS-VALIDATION
+
+cat("=== SETTING UP 5-FOLD CROSS-VALIDATION ===\n\n")
+
+# Create 5-fold CV indices
+set.seed(123)
+cv_folds <- createFolds(train_data$session_abandoned, k = 5, list = TRUE)
+
+# Create trainControl object for consistent CV across all models
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  index = cv_folds,
+  verboseIter = TRUE
+)
+
+cat("✓ 5-fold CV setup complete\n")
+cat("✓ Folds maintain class distribution\n\n")
+
+# Verify fold sizes
+cat("Fold sizes:\n")
+for(i in 1:5) {
+  cat("  Fold", i, ":", length(cv_folds[[i]]), "samples\n")
+}
+cat("\n")
+```
+
+## Logistic Regression Model
+```{r}
+# MODEL 1: LOGISTIC REGRESSION WITH 5-FOLD CV
+
+cat("=== MODEL 1: LOGISTIC REGRESSION ===\n\n")
+
+# Prepare data with factor target for caret
+train_data_caret <- copy(train_data)
+test_data_caret <- copy(test_data)
+
+train_data_caret[, session_abandoned := factor(session_abandoned, 
+                                                levels = c(0, 1), 
+                                                labels = c("No", "Yes"))]
+test_data_caret[, session_abandoned := factor(session_abandoned, 
+                                               levels = c(0, 1), 
+                                               labels = c("No", "Yes"))]
+
+# Train logistic regression with CV
+cat("Training logistic regression with 5-fold CV...\n")
+set.seed(123)
+logit_model <- train(
+  x = train_data_caret[, ..numeric_features],
+  y = train_data_caret$session_abandoned,
+  method = "glm",
+  family = "binomial",
+  trControl = train_control,
+  metric = "ROC"
+)
+
+cat("\n✓ Logistic regression training complete\n\n")
+
+# Cross-validation results
+cat("Cross-Validation Results:\n")
+print(logit_model$results)
+
+# Test set predictions
+test_pred_logit <- predict(logit_model, newdata = test_data_caret[, ..numeric_features])
+test_prob_logit <- predict(logit_model, newdata = test_data_caret[, ..numeric_features], type = "prob")
+
+# Performance metrics
+cat("\nTest Set Performance:\n")
+test_cm_logit <- confusionMatrix(test_pred_logit, test_data_caret$session_abandoned, positive = "Yes")
+print(test_cm_logit)
+
+# ROC AUC
+roc_logit <- roc(test_data_caret$session_abandoned, test_prob_logit$Yes)
+cat("\nTest Set ROC AUC:", round(auc(roc_logit), 4), "\n")
+
+# Feature importance (coefficients)
+cat("\n=== TOP 20 MOST SIGNIFICANT FEATURES (Logistic) ===\n")
+coef_summary <- summary(logit_model$finalModel)$coefficients
+coef_summary <- coef_summary[order(coef_summary[, 4]), ]
+print(head(coef_summary, 21))
+
+cat("\n✓ Logistic regression complete\n\n")
+```
+
+
+## Random Forest Model
+```{r}
+# MODEL 2: RANDOM FOREST (RANGER) WITH 5-FOLD CV
+
+cat("=== MODEL 2: RANDOM FOREST (RANGER) ===\n\n")
+
+# Train Random Forest with CV using ranger
+cat("Training Random Forest with 5-fold CV...\n")
+set.seed(123)
+
+# Define tuning grid
+rf_grid <- expand.grid(
+  mtry = c(5, 20),
+  splitrule = "gini",
+  min.node.size = c(5, 15)
+)
+
+rf_model <- train(
+  x = train_data_caret[, ..numeric_features],
+  y = train_data_caret$session_abandoned,
+  method = "ranger",
+  trControl = train_control,
+  tuneGrid = rf_grid,
+  metric = "ROC",
+  importance = "impurity",
+  num.trees = 500
+)
+
+cat("\n✓ Random Forest training complete\n\n")
+
+# Cross-validation results
+cat("Cross-Validation Results:\n")
+print(rf_model$results)
+cat("\nBest tuning parameters:\n")
+print(rf_model$bestTune)
+
+# Test set predictions
+test_pred_rf <- predict(rf_model, newdata = test_data_caret[, ..numeric_features])
+test_prob_rf <- predict(rf_model, newdata = test_data_caret[, ..numeric_features], type = "prob")
+
+# Performance metrics
+cat("\nTest Set Performance:\n")
+test_cm_rf <- confusionMatrix(test_pred_rf, test_data_caret$session_abandoned, positive = "Yes")
+print(test_cm_rf)
+
+# ROC AUC
+roc_rf <- roc(test_data_caret$session_abandoned, test_prob_rf$Yes)
+cat("\nTest Set ROC AUC:", round(auc(roc_rf), 4), "\n")
+
+# Feature importance
+cat("\n=== TOP 20 MOST IMPORTANT FEATURES (Random Forest) ===\n")
+importance_rf <- varImp(rf_model)
+print(importance_rf, top = 20)
+
+cat("\n✓ Random Forest complete\n\n")
+
+```
+
+## XGBoost Model
+```{r}
+# MODEL 3: XGBOOST WITH 5-FOLD CV
+
+cat("=== MODEL 3: XGBOOST ===\n\n")
+
+# Train XGBoost with CV
+cat("Training XGBoost with 5-fold CV...\n")
+set.seed(123)
+
+# Define tuning grid
+xgb_grid <- expand.grid(
+  nrounds = c(100, 200),
+  max_depth = c(3, 6),      # shallow + medium
+  eta = c(0.1),             # stable learning rate
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = c(1, 3),  # adds a bias–variance tradeoff lever
+  subsample = 0.8
+)
+
+xgb_model <- train(
+  x = train_data_caret[, ..numeric_features],
+  y = train_data_caret$session_abandoned,
+  method = "xgbTree",
+  trControl = train_control,
+  tuneGrid = xgb_grid,
+  metric = "ROC",
+  verbosity = 0
+)
+
+cat("\n✓ XGBoost training complete\n\n")
+
+# Cross-validation results
+cat("Cross-Validation Results:\n")
+print(head(xgb_model$results[order(-xgb_model$results$ROC), ], 10))
+cat("\nBest tuning parameters:\n")
+print(xgb_model$bestTune)
+
+# Test set predictions
+test_pred_xgb <- predict(xgb_model, newdata = test_data_caret[, ..numeric_features])
+test_prob_xgb <- predict(xgb_model, newdata = test_data_caret[, ..numeric_features], type = "prob")
+
+# Performance metrics
+cat("\nTest Set Performance:\n")
+test_cm_xgb <- confusionMatrix(test_pred_xgb, test_data_caret$session_abandoned, positive = "Yes")
+print(test_cm_xgb)
+
+# ROC AUC
+roc_xgb <- roc(test_data_caret$session_abandoned, test_prob_xgb$Yes)
+cat("\nTest Set ROC AUC:", round(auc(roc_xgb), 4), "\n")
+
+# Feature importance
+cat("\n=== TOP 20 MOST IMPORTANT FEATURES (XGBoost) ===\n")
+importance_xgb <- varImp(xgb_model)
+print(importance_xgb, top = 20)
+
+cat("\n✓ XGBoost complete\n\n")
+
+
+```
+
+# Model Comparison and Insights
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# MODEL COMPARISON
+
+cat("=== MODEL COMPARISON (5-FOLD CV + TEST SET) ===\n\n")
+
+# Comparison table
+comparison <- data.frame(
+  Model = c("Logistic Regression", "Random Forest (Ranger)", "XGBoost"),
+  
+  CV_ROC_AUC = c(
+    max(logit_model$results$ROC),
+    max(rf_model$results$ROC),
+    max(xgb_model$results$ROC)
+  ),
+  
+  Test_Accuracy = c(
+    test_cm_logit$overall["Accuracy"],
+    test_cm_rf$overall["Accuracy"],
+    test_cm_xgb$overall["Accuracy"]
+  ),
+  
+  Test_Sensitivity = c(
+    test_cm_logit$byClass["Sensitivity"],
+    test_cm_rf$byClass["Sensitivity"],
+    test_cm_xgb$byClass["Sensitivity"]
+  ),
+  
+  Test_Specificity = c(
+    test_cm_logit$byClass["Specificity"],
+    test_cm_rf$byClass["Specificity"],
+    test_cm_xgb$byClass["Specificity"]
+  ),
+  
+  Test_ROC_AUC = c(
+    auc(roc_logit),
+    auc(roc_rf),
+    auc(roc_xgb)
+  )
+)
+
+print(comparison)
+
+# Identify best model
+best_cv <- comparison$Model[which.max(comparison$CV_ROC_AUC)]
+best_test <- comparison$Model[which.max(comparison$Test_ROC_AUC)]
+
+cat("\nBest Model by CV ROC-AUC:", best_cv, "\n")
+cat("Best Model by Test ROC-AUC:", best_test, "\n\n")
+
+cat("=== SESSION-BASED MODELING COMPLETE ===\n\n")
+
+```
+
+
+## AUC curve comparison
+
+```{r}
+# PLOT: ROC CURVES COMPARISON
+
+library(ggplot2)
+
+# Create ROC curve data
+roc_data <- data.frame(
+  Model = rep(c("Logistic Regression", "Random Forest", "XGBoost"), 
+              c(length(roc_logit$specificities), 
+                length(roc_rf$specificities), 
+                length(roc_xgb$specificities))),
+  Sensitivity = c(roc_logit$sensitivities, roc_rf$sensitivities, roc_xgb$sensitivities),
+  Specificity = c(roc_logit$specificities, roc_rf$specificities, roc_xgb$specificities)
+)
+
+roc_plot <- ggplot(roc_data, aes(x = 1 - Specificity, y = Sensitivity, color = Model)) +
+  geom_line(size = 1.2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c("Logistic Regression" = "#e74c3c", 
+                                 "Random Forest" = "#27ae60", 
+                                 "XGBoost" = "#3498db")) +
+  labs(title = "ROC Curve Comparison - Test Set",
+       subtitle = paste0("Logistic AUC: ", round(auc(roc_logit), 3), 
+                        " | RF AUC: ", round(auc(roc_rf), 3),
+                        " | XGB AUC: ", round(auc(roc_xgb), 3)),
+       x = "False Positive Rate (1 - Specificity)",
+       y = "True Positive Rate (Sensitivity)") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+        plot.subtitle = element_text(size = 12, hjust = 0.5),
+        legend.position = "bottom")
+
+print(roc_plot)
+
+# Save plot
+ggsave("plots/09_roc_curve_comparison.png", roc_plot, width = 10, height = 8, dpi = 300, bg = "white")
+
+cat("\n✓ ROC curves saved to 'plots/09_roc_curve_comparison.png'\n")
+```
+
+
+## Feature importance comp
+
+```{r}
+
+# FEATURE IMPORTANCE COMPARISON ACROSS ALL MODELS
+
+cat("=== FEATURE IMPORTANCE ANALYSIS ===\n\n")
+
+# 1. Extract Feature Importance from Each Model
+
+# Logistic Regression - Use absolute value of coefficients
+logit_coefs <- summary(logit_model$finalModel)$coefficients
+logit_importance <- data.frame(
+  feature = rownames(logit_coefs)[-1],  # Remove intercept
+  importance = abs(logit_coefs[-1, "Estimate"]),
+  p_value = logit_coefs[-1, "Pr(>|z|)"],
+  model = "Logistic Regression"
+)
+logit_importance <- logit_importance[order(-logit_importance$importance), ]
+
+# Random Forest - Use variable importance
+rf_imp <- varImp(rf_model)$importance
+rf_importance <- data.frame(
+  feature = rownames(rf_imp),
+  importance = rf_imp$Overall,
+  model = "Random Forest"
+)
+rf_importance <- rf_importance[order(-rf_importance$importance), ]
+
+# XGBoost - Use variable importance
+xgb_imp <- varImp(xgb_model)$importance
+xgb_importance <- data.frame(
+  feature = rownames(xgb_imp),
+  importance = xgb_imp$Overall,
+  model = "XGBoost"
+)
+xgb_importance <- xgb_importance[order(-xgb_importance$importance), ]
+
+cat("✓ Feature importance extracted from all models\n\n")
+
+# 2. Create Combined Top 20 Features Table
+
+# Get top 20 from each model
+top_n <- 20
+
+top_logit <- head(logit_importance, top_n)
+top_rf <- head(rf_importance, top_n)
+top_xgb <- head(xgb_importance, top_n)
+
+# Combine all features
+all_features <- unique(c(top_logit$feature, top_rf$feature, top_xgb$feature))
+
+# Create comparison table
+importance_comparison <- data.frame(
+  Feature = all_features,
+  Logit_Rank = match(all_features, logit_importance$feature),
+  Logit_Importance = logit_importance$importance[match(all_features, logit_importance$feature)],
+  RF_Rank = match(all_features, rf_importance$feature),
+  RF_Importance = rf_importance$importance[match(all_features, rf_importance$feature)],
+  XGB_Rank = match(all_features, xgb_importance$feature),
+  XGB_Importance = xgb_importance$importance[match(all_features, xgb_importance$feature)]
+)
+
+# Calculate average rank (lower is better)
+importance_comparison$Avg_Rank <- rowMeans(
+  importance_comparison[, c("Logit_Rank", "RF_Rank", "XGB_Rank")], 
+  na.rm = TRUE
+)
+
+# Sort by average rank
+importance_comparison <- importance_comparison[order(importance_comparison$Avg_Rank), ]
+
+cat("=== TOP 20 FEATURES ACROSS ALL MODELS (by Average Rank) ===\n")
+print(head(importance_comparison, 20))
+cat("\n")
+
+# 3. Identify Consensus Features (Top 10 in at least 2 models)
+
+consensus_features <- importance_comparison %>%
+  filter(Logit_Rank <= 10 | RF_Rank <= 10 | XGB_Rank <= 10) %>%
+  mutate(
+    in_logit_top10 = Logit_Rank <= 10,
+    in_rf_top10 = RF_Rank <= 10,
+    in_xgb_top10 = XGB_Rank <= 10,
+    models_count = in_logit_top10 + in_rf_top10 + in_xgb_top10
+  ) %>%
+  filter(models_count >= 2) %>%
+  arrange(desc(models_count), Avg_Rank)
+
+cat("=== CONSENSUS FEATURES (Top 10 in at least 2 models) ===\n")
+print(consensus_features[, c("Feature", "models_count", "Logit_Rank", "RF_Rank", "XGB_Rank")])
+cat("\n")
+
+# 4. Visualize Feature Importance Comparison
+
+library(ggplot2)
+library(tidyr)
+
+# Prepare data for plotting - top 15 by average rank
+plot_data <- head(importance_comparison, 15) %>%
+  select(Feature, Logit_Importance, RF_Importance, XGB_Importance) %>%
+  pivot_longer(cols = -Feature, names_to = "Model", values_to = "Importance") %>%
+  mutate(
+    Model = case_when(
+      Model == "Logit_Importance" ~ "Logistic Regression",
+      Model == "RF_Importance" ~ "Random Forest",
+      Model == "XGB_Importance" ~ "XGBoost"
+    )
+  )
+
+# Normalize importance scores within each model for comparison
+plot_data <- plot_data %>%
+  group_by(Model) %>%
+  mutate(Importance_Normalized = (Importance - min(Importance, na.rm = TRUE)) / 
+                                 (max(Importance, na.rm = TRUE) - min(Importance, na.rm = TRUE)) * 100) %>%
+  ungroup()
+
+# Create grouped bar plot
+p_importance <- ggplot(plot_data, aes(x = reorder(Feature, Importance_Normalized), 
+                                       y = Importance_Normalized, 
+                                       fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("Logistic Regression" = "#e74c3c", 
+                                "Random Forest" = "#27ae60", 
+                                "XGBoost" = "#3498db")) +
+  labs(title = "Top 15 Features by Normalized Importance",
+       subtitle = "Comparison across all three models",
+       x = NULL,
+       y = "Normalized Importance (0-100)",
+       fill = "Model") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+        plot.subtitle = element_text(size = 12, hjust = 0.5),
+        legend.position = "bottom",
+        axis.text.y = element_text(size = 11))
+
+print(p_importance)
+ggsave("plots/10_feature_importance_comparison.png", p_importance, 
+       width = 12, height = 10, dpi = 300, bg = "white")
+
+cat("✓ Feature importance comparison plot saved\n\n")
+
+# 5. Feature Categories Analysis
+
+# Categorize features
+categorize_feature <- function(feature_name) {
+  case_when(
+    grepl("purchase|order|converted", feature_name, ignore.case = TRUE) ~ "Purchase History",
+    grepl("cart|add", feature_name, ignore.case = TRUE) ~ "Cart Behavior",
+    grepl("hour|day|week|month|morning|evening|business", feature_name, ignore.case = TRUE) ~ "Temporal",
+    grepl("session|duration|quick|long", feature_name, ignore.case = TRUE) ~ "Session Characteristics",
+    grepl("page|view|event", feature_name, ignore.case = TRUE) ~ "Engagement",
+    grepl("error|failed|payment", feature_name, ignore.case = TRUE) ~ "Technical Issues",
+    grepl("checkout|begin|proceed", feature_name, ignore.case = TRUE) ~ "Checkout Behavior",
+    grepl("ratio|pct|avg", feature_name, ignore.case = TRUE) ~ "Derived Metrics",
+    TRUE ~ "Other"
+  )
+}
+
+# Add categories to top features
+top_features_categorized <- head(importance_comparison, 20) %>%
+  mutate(Category = categorize_feature(Feature))
+
+cat("=== TOP 20 FEATURES BY CATEGORY ===\n")
+category_summary <- top_features_categorized %>%
+  group_by(Category) %>%
+  summarise(
+    Count = n(),
+    Features = paste(Feature, collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Count))
+
+print(category_summary)
+
+```
