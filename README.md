@@ -14,6 +14,8 @@ We used a session-based definition:
 
 We also used the purchase-to-cart ratio to measure how often cart activity led to purchase behavior.
 
+[Code found here](cart_abandonment_redefined.qmd)
+
 ---
 
 ## Findings
